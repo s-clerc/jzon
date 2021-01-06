@@ -19,9 +19,15 @@
    #:json-error
    #:json-parse-error
    #:json-eof-error)
-  (:import-from #:closer-mop))
+  (:import-from #:closer-mop)
+  (:import-from #:introspect-environment)
+  (:local-nicknames
+   (#:ie #:introspect-environment)))
 
 (in-package #:com.inuoe.jzon)
+
+#++
+(declaim (optimize (speed 3) (safety 0) (debug 0)))
 
 (define-condition json-error (simple-error) ())
 (define-condition json-parse-error (json-error)
@@ -458,19 +464,212 @@
             read-string
             pos)))
 
+(defun %coerce-into (value type)
+  (let ((exp-type (ie:typexpand type)))
+    (cond
+      ((eq exp-type  'nil)
+       (error "Cannot coerce to empty type ~A" type))
+      ((eq exp-type 't)
+       value)
+      ((eq exp-type 'null)
+       (unless (eq value 'null)
+         (error "Cannot coerce '~A' to ~A" value type))
+       nil)
+      ((subtypep exp-type 'number)
+       (coerce
+        (cond
+          ((simple-string-p value)
+           (multiple-value-bind (peek step) (%make-fns-simple-string value)
+             (%read-json-number peek step (%step step))))
+          ((stringp value)
+           (multiple-value-bind (peek step) (%make-fns-string value)
+             (%read-json-number peek step (%step step))))
+          (t value))
+        type))
+      ((or (eq exp-type 'cons)
+           (and (listp exp-type)
+                (eq (car exp-type) 'cons)))
+       (unless (and (vectorp value) (not (stringp value)))
+         (error "Cannot coerce '~A' to '~A'" value type))
+       (labels ((recurse (i type acc)
+                  (cond
+                    ((eq type 'null)
+                     (unless (= (length value) i)
+                       (error "bad len"))
+                     (nreverse acc))
+                    ((not (or (eq type 'cons)
+                              (and (listp type)
+                                   (eq (first type) 'cons))))
+                     (unless (= (length value) (1+ i))
+                       (error "bad len"))
+                     (let ((ret (nreverse acc)))
+                       (setf (cdr (last ret)) (%coerce-into (aref value i) type))
+                       ret))
+                    (t
+                     (multiple-value-bind (car cdr)
+                         (cond
+                           ((eq type 'cons)
+                            (values '* '*))
+                           ((and (listp type) (eq (car type) 'cons))
+                            (values (second type) (third type)))
+                           (t (error "impossible")))
+                       (let ((car (if (eq car '*) t (ie:typexpand car)))
+                             (cdr (if (eq cdr '*) t (ie:typexpand cdr))))
+                         (recurse (1+ i) cdr (cons (%coerce-into (aref value i) car) acc))))))))
+         (recurse 0 exp-type nil)))
+      ((let ((designator (if (atom exp-type) exp-type (car exp-type))))
+         (or (eq designator 'array)
+             (eq designator 'simple-array)
+             (eq designator 'bit-vector)
+             (eq designator 'simple-bit-vector)
+             (eq designator 'string)
+             (eq designator 'simple-string)
+             (eq designator 'base-string)
+             (eq designator 'simple-base-string)
+             (eq designator 'vector)
+             (eq designator 'simple-vector)))
+       (unless (vectorp value)
+         (error "Cannot coerce '~A' to '~A'" value type))
+       (let* ((normalized (if (atom exp-type) (list exp-type) exp-type))
+              (designator (first normalized))
+              (elt-type
+                (ecase designator
+                  ((array simple-array vector)
+                   ;; Note - handle nil typed array (eg array that can hold nothing)
+                   (if (cdr normalized) (second normalized) '*))
+                  ((bit-vector simple-bit-vector)
+                   'bit)
+                  ((base-string simple-base-string)
+                   'base-char)
+                  ((string simple-string)
+                   'character)
+                  ((simple-vector)
+                   '*)))
+              (elt-type (if (eq elt-type '*) t elt-type))
+              (coerced-elements (map 'vector (if (stringp value)
+                                                 (lambda (elt) (%coerce-into (string elt) elt-type))
+                                                 (lambda (elt) (%coerce-into elt elt-type)))
+                                     value))
+              (dimensions (third normalized)))
+         (coerce
+          (cond
+            ((null dimensions)
+             (unless (zerop (length value))
+               (error "Cannot coerce '~A' to '~A'." value type))
+             (make-array nil :element-type elt-type))
+            ((and (or (eq designator 'array)
+                       (eq designator 'simple-array))
+                   (and (listp dimensions)
+                        (not (null (cdr dimensions)))
+                        (every #'integerp dimensions)))
+              ;; Multidimensional with fixed size
+             (make-array dimensions :displaced-to coerced-elements))
+            (t
+             coerced-elements))
+          type)))
+      ((or (eq type 'base-char)
+           (eq type 'character)
+           (eq type 'extended-char)
+           (eq type 'standard-char))
+       (coerce
+        (etypecase value
+          (string    value)
+          (json-atom (stringify value))
+          (t         value))
+        type))
+      ((subtypep type 'logical-pathname)
+       (logical-pathname (etypecase value
+                           (string    value)
+                           (json-atom (stringify value))
+                           (t         value))))
+      ((subtypep type 'pathname)
+       (values (parse-namestring (etypecase value
+                                   (string    value)
+                                   (json-atom (stringify value))
+                                   (t         value)))))
+      ((eq type 'keyword)
+       (let ((name (etypecase value
+                     (string    value)
+                     (json-atom (stringify value)))))
+         (intern name 'keyword)))
+      ((or (subtypep type 'null)
+           (subtypep type 'boolean)
+           (subtypep type 'sequence)
+           (subtypep type 'hash-table))
+       (coerce value type))
+      ((symbolp type)
+       (let ((class (find-class type)))
+         (etypecase value
+           (hash-table
+            (let (;; plist of :initarg form slot/values for `make-instance'
+                  (initarg-slots-plist ())
+                  ;; alist of (slotd . value) for `(setf cmop:slot-value-using-class)'
+                  (set-value-slots-alist ()))
+              (declare (dynamic-extent initarg-slots-plist set-value-slots-alist))
+              (c2mop:ensure-finalized class)
+              (dolist (slot (c2mop:class-slots class))
+                (let* ((name (symbol-name (c2mop:slot-definition-name slot)))
+                       (name (if (some #'lower-case-p name) name (string-downcase name))))
+                  (multiple-value-bind (value value-p) (gethash name value)
+                    (when value-p
+                      (let ((coerce-value (%coerce-into value (c2cl:slot-definition-type slot)))
+                            (slot-initargs (c2mop:slot-definition-initargs slot)))
+                        (cond
+                          (slot-initargs
+                           (push coerce-value initarg-slots-plist)
+                           (push (first slot-initargs) initarg-slots-plist))
+                          (t
+                           (push (cons slot coerce-value) set-value-slots-alist))))))))
+              (let ((instance (apply #'make-instance class initarg-slots-plist)))
+                (loop :for (slot . value) :in set-value-slots-alist
+                      :do (setf (c2mop:slot-value-using-class class instance slot) value))
+                instance))))))
+      ((listp type)
+       (ecase (first type)
+         (or
+          (let ((types (rest type)))
+            (dolist (type types (error "Coercing 'or' - '~A' is not any of ~{~A~^, ~}" value types))
+              (multiple-value-bind (value errorp) (ignore-errors (%coerce-into value type))
+                (unless errorp
+                  (return value))))))
+         (and
+          ;; TODO handle subtypes (inherited class/struct) by ordering to most specialized:
+          ;; eg to handle this case:
+          ;; (defclass x ()
+          ;;   (a))
+
+          ;; (defclass y (x)
+          ;;   (b))
+
+          ;; (defclass z (y)
+          ;;   (c))
+
+          ;; (jzon:parse "{a : 0; b : 1; c : 2}" :type '(and x y z))
+          (let* ((types (rest type))
+                 (main-type (first types))
+                 (coerced (%coerce-into value main-type))
+                 (no-fits (remove coerced (rest types) :test #'typep)))
+            (when no-fits
+              (error "Coercing 'and' - Value '~A' coerced to '~A' via '~A' fails constraint for ~A" value coerced main-type no-fits))
+            (values coerced no-fits)))))
+      (t
+       (error "Don't know how to coerce into '~A'" type)))))
+
 (defun parse (in &key
                    (maximum-depth 128)
                    (allow-comments nil)
+                   (type t)
                    key-fn)
   "Read a JSON value from `in', which may be a string, a stream, or a pathname.
  `:maximum-depth' controls the maximum depth of the object/array nesting
  `:allow-comments' controls whether or not single-line // comments are allowed.
+ `:type' is the expected type of object to parse
  `:key-fn' is a function of one value which 'pools' object keys, or null for the default pool"
   (check-type maximum-depth (or (integer 1) null))
   (check-type key-fn (or null symbol function))
   (if (pathnamep in)
       (with-open-file (in in :direction :input :external-format :utf-8)
-        (parse in :maximum-depth maximum-depth :allow-comments allow-comments :key-fn key-fn))
+        (parse in :maximum-depth maximum-depth :allow-comments allow-comments :key-fn key-fn :type type))
       (multiple-value-bind (peek step read-string pos)
           (etypecase in
             (simple-string (%make-fns-simple-string in))
@@ -493,9 +692,11 @@
               (*%current-depth* 0)
               (*%pos-fn* pos))
           (declare (dynamic-extent *%string-accum* *%key-fn* *%current-depth* *%pos-fn*))
-          (prog1 (%read-json-element peek step read-string (%skip-whitespace step))
-            (or (null (%skip-whitespace step))
-                (%raise 'json-parse-error "Content after reading element")))))))
+          (%coerce-into
+           (prog1 (%read-json-element peek step read-string (%skip-whitespace step))
+             (or (null (%skip-whitespace step))
+                 (%raise 'json-parse-error "Content after reading element")))
+           type)))))
 
 (macrolet ((%coerced-fields-slots (element)
              `(let ((class (class-of ,element)))
@@ -513,8 +714,6 @@
  name is the key name and will be coerced if not already a string
  value is the value, and will be coerced if not a `json-element'
  type is a type for the key, in order to handle ambiguous `nil' interpretations")
-    (:method (element)
-      nil)
     #+(or ccl clisp sbcl)
     (:method ((element structure-object))
       (%coerced-fields-slots element))
@@ -570,8 +769,15 @@
     (string element))
   (:method ((element real) coerce-key)
     element)
+  ;; TODO replace with coercing multi-dimensional arrays
+  ;;      as arrays of arrays rather than linearizing them
+  (:method ((element array) coerce-key)
+    (coerce (make-array (array-total-size element) :displaced-to element) 'simple-vector))
   (:method ((element vector) coerce-key)
     element)
+  (:method ((element sequence) coerce-key)
+    (declare (type (and (not list) (not vector)) element))
+    (coerce element 'simple-vector))
   (:method ((element cons) coerce-key)
     ;; Try and guess alist/plist
     ;; TODO - this might be too hacky/brittle to have on by default
@@ -582,10 +788,11 @@
                                     :return nil
                                   :collect key)))
            (plist-keys (and (null alist-keys)
-                            (evenp (length element))
-                            (loop :for k :in element :by #'cddr
+                            (loop :for cell :on element :by #'cddr
+                                  :for k := (car cell)
                                   :for key := (funcall coerce-key k)
-                                  :unless (and (or (symbolp k) (stringp k))
+                                  :unless (and (cdr cell)
+                                               (or (symbolp k) (stringp k))
                                                key)
                                     :return nil
                                   :collect key))))
@@ -602,9 +809,12 @@
                :for key :in plist-keys
                :do (setf (gethash key ret) v)
                :finally (return ret)))
+        ((listp (cdr element))
+         ;; If it looks like a proper list, then consider it a list
+         (coerce element 'simple-vector))
         (t
-         ;; Otherwise treat it as a sequence
-         (coerce element 'simple-vector)))))
+         ;; Otherwise consider it a 2-element tuple
+         (vector (car element) (cdr element))))))
   (:method ((element sequence) coerce-key)
     (declare (type (and (not list) (not vector)) element))
     (coerce element 'simple-vector)))
@@ -663,6 +873,7 @@
            (dynamic-extent stack))
   (typecase element
     (json-atom (%stringify-atom element stream))
+    (pathname  (write-string (namestring element) stream))
     (t
      (let ((element (%ensure-linear-stringify element path stack)))
        (typecase element
@@ -736,6 +947,7 @@
            (dynamic-extent stack))
   (typecase element
     (json-atom (%stringify-atom element stream))
+    (pathname  (write-string (namestring element) stream))
     (t
      (let ((element (%ensure-linear-stringify element path stack)))
        (typecase element
